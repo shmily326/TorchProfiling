@@ -4,7 +4,7 @@ from asyncore import write
 import pathlib
 import sys
 from .analysis_xpu_log import parse_log as parse_xpu_log
-from .analysis import AtenOpAnalyzer, DistAnalyzer, gen_module_compare_tables, gen_module_compare_table_str
+from .analysis import AtenOpAnalyzer, GpuAtenOpAnalyzer, DistAnalyzer, gen_module_compare_tables, gen_module_compare_table_str
 import prettytable as pt
 from .cut_log import extract_section
 
@@ -140,7 +140,7 @@ def parse_log():
                 write_table(d_table, "detail", args.csv)
 
     elif args.compare and args.lhs_path and args.rhs_path:
-        analyzer1 = AtenOpAnalyzer(args.lhs_path)
+        analyzer1 = GpuAtenOpAnalyzer(args.lhs_path)
         analyzer2 = AtenOpAnalyzer(args.rhs_path)
         if args.csv:
             table_str = gen_module_compare_table_str(analyzer1, analyzer2)

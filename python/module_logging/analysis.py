@@ -320,6 +320,9 @@ class Analyzer:
         pass
 
     def identify_op_time(self, line: str):
+        if self.collection_state == STATE.DISTOP:
+            return False
+
         if (
             self.collection_state == STATE.OP
             or self.collection_state == STATE.DISTOP
@@ -365,6 +368,7 @@ class Analyzer:
         return table
 
     def get_modules(self):
+        print("self.op_or_module: {}".format(len(self.op_or_module)))
         for elem in self.op_or_module:
             if isinstance(elem, LocalModule):
                 yield elem
@@ -388,7 +392,10 @@ class AtenOpAnalyzer(Analyzer):
             or self.collection_state == STATE.MODULE
         ) and "[START_SYMBOL]" in line:
             Logger.debug("Op Start")
-            self.collection_state = STATE.OP
+            if "torch.distr" in line:
+                self.collection_state = STATE.DISTOP
+            else:
+                self.collection_state = STATE.OP
             self.current_op_name = line.rstrip("\n").split(":")[-1].replace("_", " ")
             self.current_op = AtenOp(self.current_op_name, self.current_m_name)
             return True
@@ -407,6 +414,17 @@ class AtenOpAnalyzer(Analyzer):
                 STATE.FORMAL if self.current_module is None else STATE.MODULE
             )
             return True
+        elif self.collection_state == STATE.DISTOP and "[END_SYMBOL]" in line:
+            Logger.debug("DIST Op End")
+            if self.current_module is not None:
+                self.current_module.add_elem(self.current_op)
+            else:
+                self.op_or_module.append(self.current_op)
+            self.current_op = None
+            self.collection_state = (
+                STATE.FORMAL if self.current_module is None else STATE.MODULE
+            )
+
         return False
 
     def analysis(self):
@@ -508,6 +526,60 @@ class AtenOpAnalyzer(Analyzer):
             )
         table.align = "l"
         return table
+
+class GpuAtenOpAnalyzer(AtenOpAnalyzer):
+    def __init__(self, path):
+        super().__init__(path)
+
+    def identify_op_start(self, line: str):
+        """
+        args:
+            line: a string of log file
+        return:
+            bool
+        Function:
+        1. identify the op by following symbols: [START_SYMBOL], [END_SYMBOL]
+        2. if there is no op in this iteration, return None
+        """
+        if (
+            self.collection_state == STATE.FORMAL
+            or self.collection_state == STATE.MODULE
+        ) and "[START_SYMBOL]" in line:
+            Logger.debug("Op Start")
+            if "c10d" in line:
+                self.collection_state = STATE.DISTOP
+            else:
+                self.collection_state = STATE.OP
+                
+            self.current_op_name = line.rstrip("\n").split(":")[-1].replace("_", " ")
+            self.current_op = AtenOp(self.current_op_name, self.current_m_name)
+            return True
+        return False
+
+    def identify_op_time(self, line: str):
+        if self.collection_state == STATE.DISTOP:
+            return False
+
+        if (
+            self.collection_state == STATE.OP
+            or self.collection_state == STATE.DISTOP
+        ) and "[XPURT_PROF]" in line:
+            Logger.debug("Op Time")
+            if self.current_op:
+                self.current_op.set_time(float(line.split(" ")[-2]) / 1000000)
+            return True
+        elif "[XPURT_PROF]" in line and self.current_op is None:
+            Logger.debug("unknown Op Time")
+            self.current_op =  AtenOp("custom op", self.current_m_name)
+            self.current_op.set_time(float(line.split(" ")[-2]) / 1000000)
+            self.total += self.current_op.get_time()
+            if self.current_module is not None:
+                self.current_module.add_elem(self.current_op)
+            else:
+                self.op_or_module.append(self.current_op)
+            self.current_op = None
+            return True
+        return False
 
 class DistAnalyzer(Analyzer):
     def __init__(self, path):
@@ -753,6 +825,7 @@ def merge_block(lhs: Block, rhs: Block):
             fill("GPU Time(ms)", width=30),
             fill("XPU Op", width=100),
             fill("XPU Time(ms)", width=30),
+            fill("Percent(%)", width=30),
         ]
     )
     for i in range(max_len):
@@ -766,20 +839,21 @@ def merge_block(lhs: Block, rhs: Block):
                     lhs_op.get_time(),
                     rhs_op.get_name(),
                     rhs_op.get_time(),
+                    ""
                 ]
             )
         elif i < len(lhs_op_list):
             lhs_op = lhs_op_list[i]
             table.add_row(
-                [fill("", width=200), lhs_op.get_name(), lhs_op.get_time(), "", ""]
+                [fill("", width=200), lhs_op.get_name(), lhs_op.get_time(), "", "", ""]
             )
         elif i < len(rhs_op_list):
             rhs_op = rhs_op_list[i]
             table.add_row(
-                [fill("", width=200), "", "", rhs_op.get_name(), rhs_op.get_time()]
+                [fill("", width=200), "", "", rhs_op.get_name(), rhs_op.get_time(), ""]
             )
     table.add_row(
-        [fill("", width=200), "GPU Total", lhs.get_time(), "XPU Total", rhs.get_time()]
+        [fill("", width=200), "GPU Total", lhs.get_time(), "XPU Total", rhs.get_time(), lhs.get_time() / rhs.get_time()]
     )
     return table
 
@@ -794,20 +868,71 @@ def compare(analyzer1, analyzer2):
     analyzer2.analysis()
     rhs_m_num = count_module(analyzer2.op_or_module)
     if rhs_m_num != lhs_m_num:
+        Logger.info("rhs_m_num: {}".format(rhs_m_num))
+        Logger.info("lhs_m_num: {}".format(lhs_m_num))
         Logger.error("The number of modules is not the same")
 
+    print("first analyzer")
     lhs_modules = analyzer1.get_modules()
+    print("second analyzer")
     rhs_modules = analyzer2.get_modules()
     lhs_block_list = []
     rhs_block_list = []
     for lhs_module, rhs_module in zip(lhs_modules, rhs_modules):
         lhs_sub_list, rhs_sub_list = compare_module(lhs_module, rhs_module)
-        lhs_block_list.extend(lhs_sub_list)
-        rhs_block_list.extend(rhs_sub_list)
+        for lhs, rhs in zip(lhs_sub_list, rhs_sub_list):
+            if lhs.get_time() < rhs.get_time():
+                lhs_block_list.append(lhs)
+                rhs_block_list.append(rhs)
+        # lhs_block_list.extend(lhs_sub_list)
+        # rhs_block_list.extend(rhs_sub_list)
     if len(lhs_block_list) != len(rhs_block_list):
         Logger.error("The number of blocks is not the same")
     return lhs_block_list, rhs_block_list
 
+
+def same_table(lhs, rhs):
+    lhs_rows = len(lhs._rows)
+    lhs_columns = len(lhs.field_names)
+    
+    rhs_rows = len(rhs._rows)
+    rhs_columns = len(rhs.field_names)
+
+    if (lhs_rows != rhs_rows or lhs_columns != rhs_columns):
+        return False
+    for i in range(lhs_rows - 1):
+        if (lhs._rows[i][1] != rhs._rows[i][1]):
+            return False
+        if (lhs._rows[i][3] != rhs._rows[i][3]):
+            return False
+    return True
+
+
+def sort_func(table):
+    # 获取 PrettyTable 的行数
+    num_rows = len(table._rows)
+
+    # 获取 PrettyTable 的列数
+    num_columns = len(table.field_names)
+    # print(float(table[num_rows-1][num_columns-1]))
+    return float(table._rows[num_rows-1][num_columns-1])
+
+def cal_error(table):
+    num_rows = len(table._rows)
+    num_columns = len(table.field_names)
+    lhs = table._rows[num_rows - 1][2]
+    rhs = table._rows[num_rows - 1][4]
+    return float(rhs) - float(lhs)
+    
+
+def add_column(table, column_name, content):
+    num_rows = len(table._rows)
+    num_columns = len(table.field_names)
+    contents = []
+    for i in range(num_rows - 1):
+        contents.append("")
+    contents.append(content)
+    table.add_column(column_name, contents)
 
 def gen_module_compare_tables(analyzer1, analyzer2):
     """
@@ -818,12 +943,47 @@ def gen_module_compare_tables(analyzer1, analyzer2):
     for lhs_block, rhs_block in zip(lhs_block_list, rhs_block_list):
         if len(lhs_block.get_op_list()) > 0 or len(rhs_block.get_op_list()) > 0:
             table_list.append(merge_block(lhs_block, rhs_block))
-    return table_list
+    table_list = sorted(table_list, key=sort_func)
+    non_duplicate_table_list = []
+    count_list = []
+    error_list = []
+    for table in table_list:
+        if len(count_list) != len(non_duplicate_table_list):
+            Logger.error("The number of count_list is not the same as non_duplicate_table_list")
+        find_flag = False
+        error = cal_error(table)
+        for index in range(len(non_duplicate_table_list)):
+            saved_table = non_duplicate_table_list[index]
+            if same_table(saved_table, table):
+                find_flag = True
+                count_list[index] += 1
+                error_list[index] += error
+                break
+        
+        if not find_flag:
+            count_list.append(1)
+            error_list.append(error)
+            non_duplicate_table_list.append(table)
+                
+        # if len(non_duplicate_table_list) == 0:
+        #     non_duplicate_table_list.append(table)
+        # else:
+        #     if same_table(non_duplicate_table_list[-1], table):
+        #         continue
+        #     else:
+        #         non_duplicate_table_list.append(table)
+    for index in range(len(non_duplicate_table_list)):
+        add_column(non_duplicate_table_list[index], "count", count_list[index])
+        add_column(non_duplicate_table_list[index], "Total Error(ms)", error_list[index])
+    
+    non_duplicate_table_list = sorted(non_duplicate_table_list, key=sort_func, reverse=True)
+    return non_duplicate_table_list 
 
 
 def gen_module_compare_table_str(analyzer1, analyzer2):
     if isinstance(analyzer1, AtenOpAnalyzer) and isinstance(analyzer2, AtenOpAnalyzer):
         table_list = gen_module_compare_tables(analyzer1, analyzer2)
+        table_str = ""
         for table in table_list:
             table_str += table.get_string() + "\n"
         return table_str
